@@ -28,7 +28,8 @@ def test_analysis_marks_a_viable_low_cost_scenario_as_highly_recommended() -> No
         extra_cost=0,
         rent_cost=0,
         competitors=[],
-        api_error=None,
+        rent_source="estimated",
+        rent_assumptions={},
     )
     assert analysis["rating"] == "Highly Recommended"
 
@@ -73,6 +74,8 @@ def test_analysis_endpoint_returns_calculation_and_competitors(monkeypatch) -> N
     assert body["competitor_count"] == 1
     assert body["competitors"][0]["name"] == "Example Cafe"
     assert len(body["profit_projection"]) == 12
+    assert body["rent_source"] == "estimated"
+    assert body["rent_assumptions"]["assumed_floor_area_sqm"] == 80
 
 
 def test_analysis_endpoint_rejects_invalid_input() -> None:
@@ -80,7 +83,7 @@ def test_analysis_endpoint_rejects_invalid_input() -> None:
     assert response.status_code == 422
 
 
-def test_analysis_endpoint_keeps_upstream_warning(monkeypatch) -> None:
+def test_analysis_endpoint_blocks_recommendation_when_live_data_is_unavailable(monkeypatch) -> None:
     monkeypatch.setattr(backend, "fetch_competitors", lambda *_: ([], "Overpass is unavailable."))
     response = TestClient(backend.app).post(
         "/api/analyses",
@@ -89,5 +92,52 @@ def test_analysis_endpoint_keeps_upstream_warning(monkeypatch) -> None:
             "staff_count": 3, "monthly_wage": 4500, "hours_of_work": 10, "cost_of_goods_pct": 30, "extra_cost": 1000,
         },
     )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "competitor_data_unavailable"
+
+
+def test_analysis_endpoint_uses_manual_rent_override(monkeypatch) -> None:
+    monkeypatch.setattr(backend, "fetch_competitors", lambda *_: ([], None))
+    response = TestClient(backend.app).post(
+        "/api/analyses",
+        json={
+            "latitude": -36.8485, "longitude": 174.7633, "store_type": "Cafe", "avg_sale_price": 15,
+            "staff_count": 3, "monthly_wage": 4500, "hours_of_work": 10, "cost_of_goods_pct": 30,
+            "extra_cost": 1000, "rent_override": 9876,
+        },
+    )
     assert response.status_code == 200
-    assert response.json()["api_error"] == "Overpass is unavailable."
+    assert response.json()["rent_cost"] == 9876
+    assert response.json()["rent_source"] == "manual"
+    assert response.json()["rent_assumptions"]["manual_monthly_rent"] == 9876
+
+
+def test_location_search_returns_compact_candidates(monkeypatch) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> list[dict[str, str]]:
+            return [{"display_name": "Queen Street, Auckland", "lat": "-36.848", "lon": "174.763"}]
+
+    captured: dict[str, object] = {}
+
+    def fake_get(*_args: object, **kwargs: object) -> FakeResponse:
+        captured.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(backend.requests, "get", fake_get)
+    response = TestClient(backend.app).get("/api/locations/search?q=Queen")
+    assert response.status_code == 200
+    assert response.json() == [{"display_name": "Queen Street, Auckland", "latitude": -36.848, "longitude": 174.763}]
+    assert captured["params"]["countrycodes"] == "nz"  # type: ignore[index]
+
+
+def test_location_search_rejects_short_queries() -> None:
+    response = TestClient(backend.app).get("/api/locations/search?q=ab")
+    assert response.status_code == 422
+
+
+def test_location_search_rejects_blank_query() -> None:
+    response = TestClient(backend.app).get("/api/locations/search", params={"q": "   "})
+    assert response.status_code == 422

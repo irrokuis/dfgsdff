@@ -6,7 +6,7 @@ import math
 from typing import Annotated, Any, Literal
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from requests.exceptions import RequestException
 
@@ -14,6 +14,8 @@ from requests.exceptions import RequestException
 AUCKLAND_CENTER = (-36.8485, 174.7633)
 SEARCH_RADIUS_METERS = 1_500
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+SERVICE_USER_AGENT = "CommercialSiteFeasibilityAPI/1.1 (educational demo)"
 
 # These mock baselines are monthly gross revenue benchmarks in NZD.
 INDUSTRY_BASE_REVENUE = {
@@ -91,6 +93,7 @@ class AnalysisRequest(BaseModel):
     hours_of_work: Annotated[float, Field(ge=1, le=24)]
     cost_of_goods_pct: Annotated[float, Field(ge=0, le=100)]
     extra_cost: Annotated[float, Field(ge=0, le=200_000)]
+    rent_override: Annotated[float | None, Field(default=None, ge=0, le=200_000)] = None
 
 
 app = FastAPI(title="Commercial Site Feasibility API", version="1.0.0")
@@ -109,13 +112,24 @@ def haversine_distance_meters(lat_1: float, lon_1: float, lat_2: float, lon_2: f
     return earth_radius_meters * 2 * math.atan2(math.sqrt(a_value), math.sqrt(1 - a_value))
 
 
-def estimate_commercial_rent(latitude: float, longitude: float, store_type: str) -> float:
+def estimate_commercial_rent_details(latitude: float, longitude: float, store_type: str) -> dict[str, float]:
     """Estimate monthly commercial rent from CBD distance decay and store floor-area benchmarks."""
     distance_km = haversine_distance_meters(latitude, longitude, *AUCKLAND_CENTER) / 1_000
     rent_per_sqm_year = FRINGE_RENT_PER_SQM_YEAR + (
         CBD_PEAK_RENT_PER_SQM_YEAR - FRINGE_RENT_PER_SQM_YEAR
     ) * math.exp(-distance_km / RENT_DECAY_KM)
-    return rent_per_sqm_year * ASSUMED_FLOOR_AREA_SQM[store_type] / 12
+    floor_area_sqm = float(ASSUMED_FLOOR_AREA_SQM[store_type])
+    return {
+        "distance_to_cbd_km": distance_km,
+        "annual_rent_per_sqm": rent_per_sqm_year,
+        "assumed_floor_area_sqm": floor_area_sqm,
+        "estimated_monthly_rent": rent_per_sqm_year * floor_area_sqm / 12,
+    }
+
+
+def estimate_commercial_rent(latitude: float, longitude: float, store_type: str) -> float:
+    """Return the estimated monthly rent for callers that only need the value."""
+    return estimate_commercial_rent_details(latitude, longitude, store_type)["estimated_monthly_rent"]
 
 
 def estimate_revenue_capacity(store_type: str, staff_count: int, hours_of_work: float, avg_sale_price: float) -> float:
@@ -187,7 +201,7 @@ def parse_overpass_elements(elements: list[dict[str, Any]], latitude: float, lon
 def fetch_competitors(latitude: float, longitude: float, store_type: str) -> tuple[list[dict[str, Any]], str | None]:
     """Fetch real local competitors from Overpass and return a user-safe error on failure."""
     query = build_overpass_query(store_type, latitude, longitude)
-    headers = {"User-Agent": "CommercialSiteFeasibilityAPI/1.0 (educational demo)"}
+    headers = {"User-Agent": SERVICE_USER_AGENT}
 
     try:
         response = requests.post(
@@ -200,12 +214,49 @@ def fetch_competitors(latitude: float, longitude: float, store_type: str) -> tup
         payload = response.json()
         elements = payload.get("elements", [])
         if not isinstance(elements, list):
-            return [], "The Overpass response had an unexpected format. The analysis used zero competitors."
+            return [], "The live competitor service returned an unexpected response."
         return parse_overpass_elements(elements, latitude, longitude), None
     except requests.JSONDecodeError:
-        return [], "Overpass returned an unreadable response. The analysis used zero competitors."
+        return [], "The live competitor service returned an unreadable response."
     except RequestException as error:
-        return [], f"Live competitor data could not be fetched ({error.__class__.__name__}). The analysis used zero competitors."
+        return [], f"Live competitor data could not be fetched ({error.__class__.__name__})."
+
+
+def search_locations(query: str) -> list[dict[str, float | str]]:
+    """Return a compact, Auckland-biased list of Nominatim address candidates."""
+    response = requests.get(
+        NOMINATIM_URL,
+        params={
+            "q": query,
+            "format": "jsonv2",
+            "limit": 5,
+            "countrycodes": "nz",
+            # This viewbox biases results toward Auckland without excluding nearby valid matches.
+            "viewbox": "174.55,-36.65,175.10,-37.10",
+            "bounded": 0,
+            "accept-language": "en",
+        },
+        headers={"User-Agent": SERVICE_USER_AGENT},
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise ValueError("Nominatim returned an unexpected payload")
+
+    locations: list[dict[str, float | str]] = []
+    for item in payload:
+        try:
+            display_name = str(item["display_name"])
+            latitude = float(item["lat"])
+            longitude = float(item["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if -90 <= latitude <= 90 and -180 <= longitude <= 180:
+            locations.append(
+                {"display_name": display_name, "latitude": latitude, "longitude": longitude}
+            )
+    return locations
 
 
 def calculate_analysis(
@@ -220,7 +271,8 @@ def calculate_analysis(
     extra_cost: float,
     rent_cost: float,
     competitors: list[dict[str, Any]],
-    api_error: str | None,
+    rent_source: Literal["estimated", "manual"],
+    rent_assumptions: dict[str, float | str],
 ) -> dict[str, Any]:
     """Calculate break-even, spatial adjustments, range, and feasibility rating."""
     industry_base_revenue = float(INDUSTRY_BASE_REVENUE[store_type])
@@ -292,7 +344,8 @@ def calculate_analysis(
         "capacity_revenue": capacity_revenue,
         "base_revenue": base_revenue,
         "competitors": competitors,
-        "api_error": api_error,
+        "rent_source": rent_source,
+        "rent_assumptions": rent_assumptions,
         "competitor_count": competitor_count,
         "nearest_distance": nearest_distance,
         "cannibalization_multiplier": cannibalization_multiplier,
@@ -327,11 +380,49 @@ def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/locations/search")
+def location_search(query: Annotated[str, Query(min_length=3, max_length=120, alias="q")]) -> list[dict[str, float | str]]:
+    """Search Auckland/NZ addresses without exposing a geocoding call to the browser."""
+    normalized_query = query.strip()
+    if len(normalized_query) < 3:
+        raise HTTPException(status_code=422, detail="Enter at least three non-space characters to search addresses.")
+    try:
+        return search_locations(normalized_query)
+    except (RequestException, ValueError):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "location_search_unavailable",
+                "message": "Address search is temporarily unavailable. Enter coordinates or choose a point on the map.",
+            },
+        ) from None
+
+
 @app.post("/api/analyses")
 def create_analysis(request: AnalysisRequest) -> dict[str, Any]:
     """Fetch nearby competitors and return a complete feasibility analysis."""
     competitors, api_error = fetch_competitors(request.latitude, request.longitude, request.store_type)
-    rent_cost = estimate_commercial_rent(request.latitude, request.longitude, request.store_type)
+    if api_error:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "competitor_data_unavailable",
+                "message": "Live competitor data is temporarily unavailable. Try the analysis again before making a recommendation.",
+            },
+        )
+
+    estimated_rent = estimate_commercial_rent_details(request.latitude, request.longitude, request.store_type)
+    if request.rent_override is None:
+        rent_cost = estimated_rent["estimated_monthly_rent"]
+        rent_source: Literal["estimated", "manual"] = "estimated"
+        rent_assumptions: dict[str, float | str] = estimated_rent
+    else:
+        rent_cost = request.rent_override
+        rent_source = "manual"
+        rent_assumptions = {
+            **estimated_rent,
+            "manual_monthly_rent": request.rent_override,
+        }
     analysis = calculate_analysis(
         latitude=request.latitude,
         longitude=request.longitude,
@@ -344,7 +435,8 @@ def create_analysis(request: AnalysisRequest) -> dict[str, Any]:
         extra_cost=request.extra_cost,
         rent_cost=rent_cost,
         competitors=competitors,
-        api_error=api_error,
+        rent_source=rent_source,
+        rent_assumptions=rent_assumptions,
     )
     analysis["profit_projection"] = calculate_profit_projection(
         central_estimate=float(analysis["central_estimate"]),
