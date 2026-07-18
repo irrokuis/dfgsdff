@@ -7,6 +7,9 @@ from server.models import Competitor, ForecastDriver, ProjectionMonth, ScenarioM
 
 AUCKLAND_CENTER = (-36.8485, 174.7633)
 SEARCH_RADIUS_METERS = 1_500
+# Covers the Auckland area exposed by address search. Competitor data is fetched
+# once for this extent and then filtered locally for each selected site.
+AUCKLAND_BOUNDS = (-37.10, 174.55, -36.65, 175.10)
 MODEL_VERSION = "2026.07-open-data-v1"
 INDUSTRY_BASE_REVENUE = {"Cafe": 40_000, "Convenience Store": 48_000, "Restaurant": 80_000, "Bakery": 36_000, "Pharmacy": 55_000, "Gym": 70_000}
 OSM_TAG_FILTERS = {"Cafe": ['["amenity"="cafe"]'], "Convenience Store": ['["shop"="convenience"]'], "Restaurant": ['["amenity"="restaurant"]'], "Bakery": ['["shop"="bakery"]'], "Pharmacy": ['["amenity"="pharmacy"]'], "Gym": ['["leisure"="fitness_centre"]', '["amenity"="gym"]']}
@@ -52,6 +55,22 @@ def estimate_revenue_capacity(store_type: StoreType, staff_count: int, hours_of_
 def build_overpass_query(store_type: StoreType, latitude: float, longitude: float) -> str:
     clauses = "\n".join(f"  nwr{filter_}(around:{SEARCH_RADIUS_METERS},{latitude:.6f},{longitude:.6f});" for filter_ in OSM_TAG_FILTERS[store_type])
     return f"[out:json][timeout:25];(\n{clauses}\n);out center tags;"
+
+
+def is_within_auckland_bounds(latitude: float, longitude: float) -> bool:
+    south, west, north, east = AUCKLAND_BOUNDS
+    return south <= latitude <= north and west <= longitude <= east
+
+
+def build_auckland_overpass_query() -> str:
+    """Fetch every supported competitor category in one Auckland request."""
+    south, west, north, east = AUCKLAND_BOUNDS
+    clauses = "\n".join(
+        f"  nwr{tag_filter}({south:.6f},{west:.6f},{north:.6f},{east:.6f});"
+        for tag_filters in OSM_TAG_FILTERS.values()
+        for tag_filter in tag_filters
+    )
+    return f"[out:json][timeout:90];(\n{clauses}\n);out center tags;"
 
 
 def calculate_projection(central_estimate: float, total_cost: float) -> list[ProjectionMonth]:

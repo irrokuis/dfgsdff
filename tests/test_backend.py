@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 import logging
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 import pytest
@@ -112,8 +113,8 @@ def test_location_search_validates_and_returns_models(monkeypatch: pytest.Monkey
     assert response.json()[0]["display_name"] == "Queen Street, Auckland"
 
 
-def test_provider_uses_fresh_cache(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = OpenDataProvider()
+def test_provider_refreshes_auckland_data_before_using_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    provider = OpenDataProvider(cache_path=tmp_path / "auckland_competitors.json")
     calls = 0
     class FakeResponse:
         def raise_for_status(self) -> None: return None
@@ -124,28 +125,94 @@ def test_provider_uses_fresh_cache(monkeypatch: pytest.MonkeyPatch) -> None:
         return FakeResponse()
     monkeypatch.setattr("server.providers.requests.post", post)
     _, initial = provider.competitors(-36.8485, 174.7633, "Cafe")
-    _, cached = provider.competitors(-36.8485, 174.7633, "Cafe")
-    assert calls == 1
+    _, refreshed = provider.competitors(-36.8485, 174.7633, "Cafe")
+    assert calls == 2
     assert initial.cache_status == "live"
-    assert cached.cache_status == "fresh_cache"
+    assert refreshed.cache_status == "live"
 
 
-def test_provider_uses_stale_cache_when_live_competitor_data_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = OpenDataProvider()
-    cached_competitors = [Competitor(id="node/1", name="Cached Cafe", kind="Cafe", latitude=-36.85, longitude=174.76, distance_m=250)]
-    provider._competitor_cache[(-36.8485, 174.7633, "Cafe")] = (datetime.now(UTC) - timedelta(minutes=11), cached_competitors)
+def test_provider_refreshes_the_persisted_auckland_snapshot_for_nearby_sites(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Every Auckland lookup should request fresh data before considering cache."""
+    provider = OpenDataProvider(cache_path=tmp_path / "auckland_competitors.json")
+    calls = 0
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "elements": [
+                    {
+                        "type": "node",
+                        "id": 1,
+                        "lat": -36.8485,
+                        "lon": 174.7633,
+                        "tags": {"name": "Cached Cafe", "amenity": "cafe"},
+                    }
+                ]
+            }
+
+    def post(*_: object, **__: object) -> FakeResponse:
+        nonlocal calls
+        calls += 1
+        return FakeResponse()
+
+    monkeypatch.setattr("server.providers.requests.post", post)
+    initial, initial_freshness = provider.competitors(-36.8485, 174.7633, "Cafe")
+    moved_pin, moved_freshness = provider.competitors(-36.8500, 174.7650, "Cafe")
+
+    assert calls == 2
+    assert initial[0].name == "Cached Cafe"
+    assert moved_pin[0].name == "Cached Cafe"
+    assert initial_freshness.cache_status == "live"
+    assert moved_freshness.cache_status == "live"
+    assert (tmp_path / "auckland_competitors.json").exists()
+
+    restarted_provider = OpenDataProvider(cache_path=tmp_path / "auckland_competitors.json")
+    _, restarted_freshness = restarted_provider.competitors(-36.8485, 174.7633, "Cafe")
+    assert calls == 3
+    assert restarted_freshness.cache_status == "live"
+
+
+def test_provider_falls_back_to_auckland_snapshot_when_refresh_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    provider = OpenDataProvider(cache_path=tmp_path / "auckland_competitors.json")
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"elements": [{"type": "node", "id": 1, "lat": -36.8485, "lon": 174.7633, "tags": {"name": "Cached Cafe", "amenity": "cafe"}}]}
+
+    monkeypatch.setattr("server.providers.requests.post", lambda *_args, **_kwargs: FakeResponse())
+    provider.competitors(-36.8485, 174.7633, "Cafe")
 
     def unavailable(*_args: object, **_kwargs: object) -> object:
         raise requests.RequestException("Overpass unavailable")
 
     monkeypatch.setattr("server.providers.requests.post", unavailable)
     competitors, freshness = provider.competitors(-36.8485, 174.7633, "Cafe")
+    assert competitors[0].name == "Cached Cafe"
+    assert freshness.cache_status == "stale_cache"
+
+
+def test_provider_uses_stale_cache_when_live_competitor_data_is_unavailable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    provider = OpenDataProvider(cache_path=tmp_path / "auckland_competitors.json")
+    cached_competitors = [Competitor(id="node/1", name="Cached Cafe", kind="Cafe", latitude=-36.85, longitude=174.76, distance_m=250)]
+    provider._competitor_cache[(-40.0, 174.7633, "Cafe")] = (datetime.now(UTC) - timedelta(minutes=11), cached_competitors)
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise requests.RequestException("Overpass unavailable")
+
+    monkeypatch.setattr("server.providers.requests.post", unavailable)
+    competitors, freshness = provider.competitors(-40.0, 174.7633, "Cafe")
     assert competitors == cached_competitors
     assert freshness.cache_status == "stale_cache"
 
 
-def test_provider_logs_the_upstream_failure_when_no_cache_is_available(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-    provider = OpenDataProvider()
+def test_provider_logs_the_upstream_failure_when_no_cache_is_available(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path) -> None:
+    provider = OpenDataProvider(cache_path=tmp_path / "auckland_competitors.json")
     error = requests.HTTPError("rate limited")
     error.response = type("Response", (), {"status_code": 429})()
 
@@ -156,13 +223,13 @@ def test_provider_logs_the_upstream_failure_when_no_cache_is_available(monkeypat
     with caplog.at_level(logging.WARNING, logger="server.providers"), pytest.raises(ProviderUnavailable) as raised:
         provider.competitors(-36.8485, 174.7633, "Cafe")
     assert raised.value.code == "competitor_data_rate_limited"
-    assert "overpass_request_failed" in caplog.text
+    assert "auckland_snapshot_refresh_failed" in caplog.text
     assert "error_type=HTTPError" in caplog.text
     assert "status_code=429" in caplog.text
 
 
-def test_provider_rejects_malformed_competitor_payload(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = OpenDataProvider()
+def test_provider_rejects_malformed_competitor_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    provider = OpenDataProvider(cache_path=tmp_path / "auckland_competitors.json")
     class FakeResponse:
         def raise_for_status(self) -> None: return None
         def json(self) -> dict[str, object]: return {"elements": "not-a-list"}

@@ -27,10 +27,16 @@ npm run dev
 
 Open the URL printed by Vite (normally `http://localhost:5173`). Vite proxies `/api` requests to FastAPI at `http://127.0.0.1:8000`.
 
+Before a presentation, refresh the Auckland snapshot once while Overpass is available:
+
+```bash
+python3 scripts/warm_auckland_competitors.py
+```
+
 ## Data and forecast model
 
 - Address lookup uses Nominatim and competitor discovery uses OpenStreetMap via Overpass.
-- Successful competitor responses are cached for 10 minutes and visibly labelled as live or fresh cached data. Stale data never generates a recommendation.
+- Auckland competitor data is fetched as one city-wide OpenStreetMap snapshot, written to `data/auckland_competitors.json`, and filtered locally within the 1.5 km site radius. Each analysis tries to refresh the snapshot first; if Overpass is unavailable, the last snapshot remains available as a clearly labelled stale fallback for 90 days, including after a service restart. Locations outside Auckland follow the same live-first, cache-on-failure behaviour.
 - Revenue, rent, competition, ramp-up, and seasonality assumptions are held in `server/policy.py`. The app returns the model version, forecast drivers, and limitations with every analysis.
 - This is a screening tool, not financial advice. Validate local demand, lease terms, fit-out costs, and the actual site before committing.
 
