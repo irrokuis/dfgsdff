@@ -1,6 +1,6 @@
 import type { AnalysisRequest, ScenarioMode, StoreType } from "./api/generated";
 
-export type LocationSelection = { kind: "unselected" } | { kind: "address" | "manual" | "map"; latitude: number; longitude: number; displayName: string };
+export type LocationSelection = { kind: "unselected" } | { kind: "address" | "map"; latitude: number; longitude: number; displayName: string };
 export interface ScenarioFormValues { storeType: StoreType; scenarioMode: ScenarioMode; avgSalePrice: string; staffCount: string; monthlyWage: string; hoursOfWork: string; costOfGoodsPct: string; extraCost: string; rentOverride: string }
 export const defaultScenario: ScenarioFormValues = { storeType: "Cafe", scenarioMode: "base", avgSalePrice: "15", staffCount: "3", monthlyWage: "4500", hoursOfWork: "10", costOfGoodsPct: "30", extraCost: "1000", rentOverride: "" };
 
@@ -12,7 +12,7 @@ function numberInRange(value: string, min: number, max: number, integer = false)
 
 export function validateScenario(location: LocationSelection, values: ScenarioFormValues): Record<string, string> {
   const errors: Record<string, string> = {};
-  if (location.kind === "unselected") errors.location = "Choose an address, enter both coordinates, or select a point on the map.";
+  if (location.kind === "unselected") errors.location = "Choose an address or select a point on the map.";
   if (numberInRange(values.avgSalePrice, 0, 5_000) === null) errors.avgSalePrice = "Enter an amount between 0 and 5,000.";
   if (numberInRange(values.staffCount, 1, 100, true) === null) errors.staffCount = "Enter a whole number between 1 and 100.";
   if (numberInRange(values.monthlyWage, 0, 50_000) === null) errors.monthlyWage = "Enter an amount between 0 and 50,000.";
