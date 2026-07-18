@@ -1,0 +1,286 @@
+"""Pure calculation and data-fetching logic for the commercial site feasibility screener."""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+import requests
+from requests.exceptions import RequestException
+
+
+AUCKLAND_CENTER = (-36.8485, 174.7633)
+SEARCH_RADIUS_METERS = 1_500
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+# These mock baselines are monthly gross revenue benchmarks in NZD.
+INDUSTRY_BASE_REVENUE = {
+    "Cafe": 40_000,
+    "Convenience Store": 48_000,
+    "Restaurant": 80_000,
+    "Bakery": 36_000,
+    "Pharmacy": 55_000,
+    "Gym": 70_000,
+}
+
+# Every item is an Overpass QL tag filter for the selected business category.
+OSM_TAG_FILTERS = {
+    "Cafe": ['["amenity"="cafe"]'],
+    "Convenience Store": ['["shop"="convenience"]'],
+    "Restaurant": ['["amenity"="restaurant"]'],
+    "Bakery": ['["shop"="bakery"]'],
+    "Pharmacy": ['["amenity"="pharmacy"]'],
+    "Gym": ['["leisure"="fitness_centre"]', '["amenity"="gym"]'],
+}
+
+# Commercial rent benchmarks: CBD-core and fringe annual NZD/sqm rates plus the
+# assumed floor area per store type, used to estimate rent instead of asking for it.
+CBD_PEAK_RENT_PER_SQM_YEAR = 850
+FRINGE_RENT_PER_SQM_YEAR = 180
+RENT_DECAY_KM = 4.5
+
+ASSUMED_FLOOR_AREA_SQM = {
+    "Cafe": 80,
+    "Convenience Store": 120,
+    "Restaurant": 160,
+    "Bakery": 70,
+    "Pharmacy": 110,
+    "Gym": 320,
+}
+
+# Assumed customer throughput per staff member per hour, used with staff count,
+# hours of work, and average sale price to estimate revenue capacity.
+TRANSACTIONS_PER_STAFF_HOUR = {
+    "Cafe": 6,
+    "Convenience Store": 10,
+    "Restaurant": 4,
+    "Bakery": 8,
+    "Pharmacy": 5,
+}
+OPERATING_DAYS_PER_MONTH = 26
+
+# Gyms run on recurring memberships rather than per-visit transactions, so their
+# capacity is modeled as staff-supportable members rather than hourly throughput.
+SUBSCRIPTION_STORE_TYPES = {"Gym"}
+GYM_MEMBERS_PER_STAFF = 120
+BASELINE_HOURS_OF_WORK = 10
+
+# New sites rarely open at full demand; revenue ramps from a reduced share of the
+# estimate up to 100% over the first few months, then holds steady.
+RAMP_UP_MONTHS = 4
+RAMP_START_FACTOR = 0.55
+
+# Generic NZ retail/hospitality seasonality (Jan-Dec), applied assuming month 1
+# of the projection is January: summer and Christmas peaks, winter trough.
+SEASONAL_MULTIPLIER_BY_CALENDAR_MONTH = [1.10, 1.05, 1.00, 0.98, 0.92, 0.85, 0.85, 0.88, 0.95, 1.00, 1.05, 1.15]
+
+
+def haversine_distance_meters(lat_1: float, lon_1: float, lat_2: float, lon_2: float) -> float:
+    """Calculate the great-circle distance between two WGS84 coordinates."""
+    earth_radius_meters = 6_371_000
+    lat_1_rad, lat_2_rad = math.radians(lat_1), math.radians(lat_2)
+    delta_lat = math.radians(lat_2 - lat_1)
+    delta_lon = math.radians(lon_2 - lon_1)
+    a_value = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat_1_rad) * math.cos(lat_2_rad) * math.sin(delta_lon / 2) ** 2
+    )
+    return earth_radius_meters * 2 * math.atan2(math.sqrt(a_value), math.sqrt(1 - a_value))
+
+
+def estimate_commercial_rent(latitude: float, longitude: float, store_type: str) -> float:
+    """Estimate monthly commercial rent from CBD distance decay and store floor-area benchmarks."""
+    distance_km = haversine_distance_meters(latitude, longitude, *AUCKLAND_CENTER) / 1_000
+    rent_per_sqm_year = FRINGE_RENT_PER_SQM_YEAR + (
+        CBD_PEAK_RENT_PER_SQM_YEAR - FRINGE_RENT_PER_SQM_YEAR
+    ) * math.exp(-distance_km / RENT_DECAY_KM)
+    return rent_per_sqm_year * ASSUMED_FLOOR_AREA_SQM[store_type] / 12
+
+
+def estimate_revenue_capacity(store_type: str, staff_count: int, hours_of_work: float, avg_sale_price: float) -> float:
+    """Estimate monthly revenue capacity from staffing throughput and average sale price."""
+    if store_type in SUBSCRIPTION_STORE_TYPES:
+        # avg_sale_price is the estimated monthly revenue per customer (e.g. a membership fee).
+        return staff_count * (hours_of_work / BASELINE_HOURS_OF_WORK) * GYM_MEMBERS_PER_STAFF * avg_sale_price
+    return (
+        staff_count
+        * hours_of_work
+        * OPERATING_DAYS_PER_MONTH
+        * TRANSACTIONS_PER_STAFF_HOUR[store_type]
+        * avg_sale_price
+    )
+
+
+def build_overpass_query(store_type: str, latitude: float, longitude: float) -> str:
+    """Build a bounded Overpass QL query for nodes, ways, and relations."""
+    clauses = "\n".join(
+        f'  nwr{tag_filter}(around:{SEARCH_RADIUS_METERS},{latitude:.6f},{longitude:.6f});'
+        for tag_filter in OSM_TAG_FILTERS[store_type]
+    )
+    return f"""
+    [out:json][timeout:25];
+    (
+    {clauses}
+    );
+    out center tags;
+    """
+
+
+def parse_overpass_elements(elements: list[dict[str, Any]], latitude: float, longitude: float) -> list[dict[str, Any]]:
+    """Normalize Overpass nodes and centered ways/relations into map-ready records."""
+    competitors: list[dict[str, Any]] = []
+    seen_ids: set[tuple[str, int]] = set()
+
+    for element in elements:
+        element_id = (str(element.get("type", "unknown")), int(element.get("id", -1)))
+        if element_id in seen_ids:
+            continue
+        seen_ids.add(element_id)
+
+        # Nodes carry lat/lon directly. Ways and relations use the requested center field.
+        point_lat = element.get("lat")
+        point_lon = element.get("lon")
+        if point_lat is None or point_lon is None:
+            center = element.get("center", {})
+            point_lat = center.get("lat")
+            point_lon = center.get("lon")
+        if point_lat is None or point_lon is None:
+            continue
+
+        tags = element.get("tags", {})
+        business_kind = tags.get("amenity") or tags.get("shop") or tags.get("leisure") or "business"
+        competitors.append(
+            {
+                "id": f"{element_id[0]}/{element_id[1]}",
+                "name": tags.get("name", "Unnamed business"),
+                "kind": business_kind.replace("_", " ").title(),
+                "latitude": float(point_lat),
+                "longitude": float(point_lon),
+                "distance_m": haversine_distance_meters(latitude, longitude, float(point_lat), float(point_lon)),
+            }
+        )
+
+    return sorted(competitors, key=lambda item: float(item["distance_m"]))
+
+
+def fetch_competitors(latitude: float, longitude: float, store_type: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Fetch real local competitors from Overpass and return a user-safe error on failure."""
+    query = build_overpass_query(store_type, latitude, longitude)
+    headers = {"User-Agent": "CommercialSiteFeasibilityStreamlit/1.0 (educational demo)"}
+
+    try:
+        response = requests.post(
+            OVERPASS_URL,
+            data={"data": query},
+            headers=headers,
+            timeout=40,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        elements = payload.get("elements", [])
+        if not isinstance(elements, list):
+            return [], "The Overpass response had an unexpected format. The analysis used zero competitors."
+        return parse_overpass_elements(elements, latitude, longitude), None
+    except requests.JSONDecodeError:
+        return [], "Overpass returned an unreadable response. The analysis used zero competitors."
+    except RequestException as error:
+        return [], f"Live competitor data could not be fetched ({error.__class__.__name__}). The analysis used zero competitors."
+
+
+def calculate_analysis(
+    latitude: float,
+    longitude: float,
+    store_type: str,
+    avg_sale_price: float,
+    staff_count: int,
+    monthly_wage: float,
+    hours_of_work: float,
+    cost_of_goods_pct: float,
+    extra_cost: float,
+    rent_cost: float,
+    competitors: list[dict[str, Any]],
+    api_error: str | None,
+) -> dict[str, Any]:
+    """Calculate break-even, spatial adjustments, range, and feasibility rating."""
+    industry_base_revenue = float(INDUSTRY_BASE_REVENUE[store_type])
+    capacity_revenue = estimate_revenue_capacity(store_type, staff_count, hours_of_work, avg_sale_price)
+    # Blend the industry benchmark with the staffing/sale-price-driven capacity estimate.
+    base_revenue = (industry_base_revenue + capacity_revenue) / 2
+
+    distances = [float(item["distance_m"]) for item in competitors]
+    nearest_distance = min(distances) if distances else None
+
+    # Very close peers cause a stronger cannibalization effect than distant peers.
+    if nearest_distance is None or nearest_distance >= 500:
+        cannibalization_multiplier = 1.00
+    elif nearest_distance >= 250:
+        cannibalization_multiplier = 0.90
+    elif nearest_distance >= 100:
+        cannibalization_multiplier = 0.78
+    else:
+        cannibalization_multiplier = 0.60
+
+    # A larger nearby cluster is interpreted as a commercial-hub foot-traffic signal.
+    competitor_count = len(competitors)
+    foot_traffic_multiplier = 1.00 + min(0.20, competitor_count * 0.015)
+    central_estimate = base_revenue * cannibalization_multiplier * foot_traffic_multiplier
+    revenue_min = central_estimate * 0.85
+    revenue_max = central_estimate * 1.15
+
+    labor_cost = staff_count * monthly_wage
+    cost_of_goods_cost = central_estimate * (cost_of_goods_pct / 100)
+    total_cost = labor_cost + cost_of_goods_cost + rent_cost + extra_cost
+    twenty_percent_buffer = total_cost * 1.20
+
+    if revenue_min >= twenty_percent_buffer:
+        rating = "Highly Recommended"
+        rating_color = "#087f5b"
+        rating_detail = "The conservative revenue estimate covers all monthly costs and a 20% operating buffer."
+    elif revenue_max < total_cost:
+        rating = "Not Recommended"
+        rating_color = "#c92a2a"
+        rating_detail = "Even the optimistic revenue estimate is below the monthly break-even point."
+    elif revenue_max < twenty_percent_buffer:
+        rating = "Risky - Cost Pressure"
+        rating_color = "#d97706"
+        rating_detail = "The scenario may cover costs, but it does not reach the 20% operating buffer."
+    elif nearest_distance is not None and nearest_distance < 100:
+        rating = "Risky - High Competition"
+        rating_color = "#d97706"
+        rating_detail = "The revenue range can be viable, but a same-type competitor is within 100 metres."
+    else:
+        rating = "Recommended with Conditions"
+        rating_color = "#2563eb"
+        rating_detail = "The upside reaches the 20% operating buffer; validate demand before committing."
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "store_type": store_type,
+        "avg_sale_price": avg_sale_price,
+        "staff_count": staff_count,
+        "monthly_wage": monthly_wage,
+        "hours_of_work": hours_of_work,
+        "cost_of_goods_pct": cost_of_goods_pct,
+        "labor_cost": labor_cost,
+        "cost_of_goods_cost": cost_of_goods_cost,
+        "rent_cost": rent_cost,
+        "extra_cost": extra_cost,
+        "total_cost": total_cost,
+        "industry_base_revenue": industry_base_revenue,
+        "capacity_revenue": capacity_revenue,
+        "base_revenue": base_revenue,
+        "competitors": competitors,
+        "api_error": api_error,
+        "competitor_count": competitor_count,
+        "nearest_distance": nearest_distance,
+        "cannibalization_multiplier": cannibalization_multiplier,
+        "foot_traffic_multiplier": foot_traffic_multiplier,
+        "revenue_min": revenue_min,
+        "central_estimate": central_estimate,
+        "revenue_max": revenue_max,
+        "twenty_percent_buffer": twenty_percent_buffer,
+        "rating": rating,
+        "rating_color": rating_color,
+        "rating_detail": rating_detail,
+    }
