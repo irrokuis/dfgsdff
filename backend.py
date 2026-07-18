@@ -37,4 +37,4 @@ def create_analysis(request: AnalysisRequest) -> AnalysisResponse:
     try:
         return service.analyse(request)
     except ProviderUnavailable as error:
-        raise HTTPException(status_code=503, detail={"code": "competitor_data_unavailable", "message": str(error)}) from None
+        raise HTTPException(status_code=503, detail={"code": error.code, "message": str(error)}) from None

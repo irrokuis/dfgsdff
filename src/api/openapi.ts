@@ -203,7 +203,7 @@ export interface components {
              * Cache Status
              * @enum {string}
              */
-            cache_status: "live" | "fresh_cache";
+            cache_status: "live" | "fresh_cache" | "stale_cache";
             /**
              * Expires At
              * Format: date-time

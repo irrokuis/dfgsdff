@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -13,10 +14,14 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 HEADERS = {"User-Agent": "CommercialSiteFeasibilityAPI/2.0 (educational demo)"}
 CACHE_TTL = timedelta(minutes=10)
+STALE_CACHE_TTL = timedelta(hours=24)
+logger = logging.getLogger(__name__)
 
 
 class ProviderUnavailable(Exception):
-    pass
+    def __init__(self, message: str, code: str = "competitor_data_unavailable") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class OpenDataProvider:
@@ -36,7 +41,29 @@ class OpenDataProvider:
             elements = payload.get("elements", [])
             if not isinstance(elements, list):
                 raise ProviderUnavailable("The competitor provider returned an unexpected response.")
-        except (RequestException, requests.JSONDecodeError) as error:
+        except (RequestException, requests.JSONDecodeError, ProviderUnavailable) as error:
+            response = getattr(error, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if cached and now - cached[0] < STALE_CACHE_TTL:
+                logger.warning(
+                    "overpass_request_failed_using_stale_cache error_type=%s status_code=%s store_type=%s cache_age_seconds=%d",
+                    type(error).__name__, status_code, store_type, (now - cached[0]).total_seconds(),
+                )
+                return cached[1], DataFreshness(
+                    source="OpenStreetMap via Overpass",
+                    fetched_at=cached[0],
+                    cache_status="stale_cache",
+                    expires_at=cached[0] + CACHE_TTL,
+                )
+            logger.warning(
+                "overpass_request_failed error_type=%s status_code=%s store_type=%s cache_available=%s",
+                type(error).__name__, status_code, store_type, cached is not None,
+            )
+            if status_code == 429:
+                raise ProviderUnavailable(
+                    "Live competitor data is rate limited. Please wait a moment and try again.",
+                    code="competitor_data_rate_limited",
+                ) from error
             raise ProviderUnavailable("Live competitor data is temporarily unavailable.") from error
         businesses = self._parse_competitors(elements, latitude, longitude)
         self._competitor_cache[key] = (now, businesses)

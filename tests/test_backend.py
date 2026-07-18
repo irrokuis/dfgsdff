@@ -1,7 +1,9 @@
 from datetime import UTC, datetime, timedelta
+import logging
 
 from fastapi.testclient import TestClient
 import pytest
+import requests
 
 import backend
 from server.models import Competitor, DataFreshness
@@ -88,6 +90,19 @@ def test_analysis_reports_provider_unavailable(monkeypatch: pytest.MonkeyPatch) 
     assert response.json()["detail"]["code"] == "competitor_data_unavailable"
 
 
+def test_analysis_explains_competitor_rate_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    def rate_limited(*_: object) -> object:
+        raise ProviderUnavailable("Live competitor data is rate limited. Please wait a moment and try again.", code="competitor_data_rate_limited")
+
+    monkeypatch.setattr(backend.provider, "competitors", rate_limited)
+    response = TestClient(backend.app).post("/api/analyses", json=scenario())
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "competitor_data_rate_limited",
+        "message": "Live competitor data is rate limited. Please wait a moment and try again.",
+    }
+
+
 def test_location_search_validates_and_returns_models(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(backend.provider, "locations", lambda *_: [{"display_name": "Queen Street, Auckland", "latitude": -36.848, "longitude": 174.763}])
     client = TestClient(backend.app)
@@ -113,6 +128,37 @@ def test_provider_uses_fresh_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == 1
     assert initial.cache_status == "live"
     assert cached.cache_status == "fresh_cache"
+
+
+def test_provider_uses_stale_cache_when_live_competitor_data_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = OpenDataProvider()
+    cached_competitors = [Competitor(id="node/1", name="Cached Cafe", kind="Cafe", latitude=-36.85, longitude=174.76, distance_m=250)]
+    provider._competitor_cache[(-36.8485, 174.7633, "Cafe")] = (datetime.now(UTC) - timedelta(minutes=11), cached_competitors)
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise requests.RequestException("Overpass unavailable")
+
+    monkeypatch.setattr("server.providers.requests.post", unavailable)
+    competitors, freshness = provider.competitors(-36.8485, 174.7633, "Cafe")
+    assert competitors == cached_competitors
+    assert freshness.cache_status == "stale_cache"
+
+
+def test_provider_logs_the_upstream_failure_when_no_cache_is_available(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    provider = OpenDataProvider()
+    error = requests.HTTPError("rate limited")
+    error.response = type("Response", (), {"status_code": 429})()
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr("server.providers.requests.post", unavailable)
+    with caplog.at_level(logging.WARNING, logger="server.providers"), pytest.raises(ProviderUnavailable) as raised:
+        provider.competitors(-36.8485, 174.7633, "Cafe")
+    assert raised.value.code == "competitor_data_rate_limited"
+    assert "overpass_request_failed" in caplog.text
+    assert "error_type=HTTPError" in caplog.text
+    assert "status_code=429" in caplog.text
 
 
 def test_provider_rejects_malformed_competitor_payload(monkeypatch: pytest.MonkeyPatch) -> None:

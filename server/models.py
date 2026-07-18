@@ -61,7 +61,7 @@ class ForecastDriver(BaseModel):
 class DataFreshness(BaseModel):
     source: str
     fetched_at: datetime
-    cache_status: Literal["live", "fresh_cache"]
+    cache_status: Literal["live", "fresh_cache", "stale_cache"]
     expires_at: datetime
 
 
