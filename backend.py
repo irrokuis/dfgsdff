@@ -1,11 +1,13 @@
-"""Pure calculation and data-fetching logic for the commercial site feasibility screener."""
+"""FastAPI service and feasibility calculations for commercial site screening."""
 
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Annotated, Any, Literal
 
 import requests
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
 from requests.exceptions import RequestException
 
 
@@ -73,6 +75,25 @@ RAMP_START_FACTOR = 0.55
 # Generic NZ retail/hospitality seasonality (Jan-Dec), applied assuming month 1
 # of the projection is January: summer and Christmas peaks, winter trough.
 SEASONAL_MULTIPLIER_BY_CALENDAR_MONTH = [1.10, 1.05, 1.00, 0.98, 0.92, 0.85, 0.85, 0.88, 0.95, 1.00, 1.05, 1.15]
+
+StoreType = Literal["Cafe", "Convenience Store", "Restaurant", "Bakery", "Pharmacy", "Gym"]
+
+
+class AnalysisRequest(BaseModel):
+    """Validated inputs supplied by the Vite client for one site analysis."""
+
+    latitude: Annotated[float, Field(ge=-90, le=90)]
+    longitude: Annotated[float, Field(ge=-180, le=180)]
+    store_type: StoreType
+    avg_sale_price: Annotated[float, Field(ge=0, le=5_000)]
+    staff_count: Annotated[int, Field(ge=1, le=100)]
+    monthly_wage: Annotated[float, Field(ge=0, le=50_000)]
+    hours_of_work: Annotated[float, Field(ge=1, le=24)]
+    cost_of_goods_pct: Annotated[float, Field(ge=0, le=100)]
+    extra_cost: Annotated[float, Field(ge=0, le=200_000)]
+
+
+app = FastAPI(title="Commercial Site Feasibility API", version="1.0.0")
 
 
 def haversine_distance_meters(lat_1: float, lon_1: float, lat_2: float, lon_2: float) -> float:
@@ -166,7 +187,7 @@ def parse_overpass_elements(elements: list[dict[str, Any]], latitude: float, lon
 def fetch_competitors(latitude: float, longitude: float, store_type: str) -> tuple[list[dict[str, Any]], str | None]:
     """Fetch real local competitors from Overpass and return a user-safe error on failure."""
     query = build_overpass_query(store_type, latitude, longitude)
-    headers = {"User-Agent": "CommercialSiteFeasibilityStreamlit/1.0 (educational demo)"}
+    headers = {"User-Agent": "CommercialSiteFeasibilityAPI/1.0 (educational demo)"}
 
     try:
         response = requests.post(
@@ -284,3 +305,49 @@ def calculate_analysis(
         "rating_color": rating_color,
         "rating_detail": rating_detail,
     }
+
+
+def calculate_profit_projection(central_estimate: float, total_cost: float) -> list[dict[str, float | int]]:
+    """Return a 12-month profit forecast using the current ramp-up and seasonality assumptions."""
+    projection: list[dict[str, float | int]] = []
+    for month in range(1, 13):
+        if month < RAMP_UP_MONTHS:
+            ramp_progress = (month - 1) / (RAMP_UP_MONTHS - 1)
+            ramp_factor = RAMP_START_FACTOR + (1 - RAMP_START_FACTOR) * ramp_progress
+        else:
+            ramp_factor = 1.0
+        revenue = central_estimate * ramp_factor * SEASONAL_MULTIPLIER_BY_CALENDAR_MONTH[month - 1]
+        projection.append({"month": month, "revenue": revenue, "profit": revenue - total_cost})
+    return projection
+
+
+@app.get("/api/health")
+def health_check() -> dict[str, str]:
+    """Report that the local API process is ready to accept requests."""
+    return {"status": "ok"}
+
+
+@app.post("/api/analyses")
+def create_analysis(request: AnalysisRequest) -> dict[str, Any]:
+    """Fetch nearby competitors and return a complete feasibility analysis."""
+    competitors, api_error = fetch_competitors(request.latitude, request.longitude, request.store_type)
+    rent_cost = estimate_commercial_rent(request.latitude, request.longitude, request.store_type)
+    analysis = calculate_analysis(
+        latitude=request.latitude,
+        longitude=request.longitude,
+        store_type=request.store_type,
+        avg_sale_price=request.avg_sale_price,
+        staff_count=request.staff_count,
+        monthly_wage=request.monthly_wage,
+        hours_of_work=request.hours_of_work,
+        cost_of_goods_pct=request.cost_of_goods_pct,
+        extra_cost=request.extra_cost,
+        rent_cost=rent_cost,
+        competitors=competitors,
+        api_error=api_error,
+    )
+    analysis["profit_projection"] = calculate_profit_projection(
+        central_estimate=float(analysis["central_estimate"]),
+        total_cost=float(analysis["total_cost"]),
+    )
+    return analysis
