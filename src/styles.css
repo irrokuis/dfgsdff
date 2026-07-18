@@ -961,6 +961,83 @@ h1, h2, h3, h4, strong {
   border: 0;
 }
 
+.forecast-story {
+  grid-column: span 12;
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 24px;
+}
+
+.forecast-story > div > p,
+.driver-list p,
+.freshness,
+.rating-reasons {
+  color: var(--color-text-muted);
+  line-height: 1.45;
+}
+
+.driver-list {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.driver-list article {
+  border-left: 3px solid #2563eb;
+  padding: 4px 0 4px 12px;
+}
+
+.driver-list strong,
+.driver-list span {
+  display: block;
+}
+
+.driver-list span {
+  color: #2563eb;
+  font-size: .8rem;
+  font-weight: 700;
+  margin-top: 4px;
+}
+
+.freshness {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: .8rem;
+}
+
+.rating-reasons {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  font-size: .8rem;
+}
+
+.distance-bands {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin: 16px 0;
+}
+
+.distance-bands span {
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-size: .78rem;
+  padding: 10px;
+}
+
+.distance-bands strong {
+  display: block;
+  font-size: 1.25rem;
+  margin-top: 4px;
+}
+
+.summary-heading {
+  margin-top: 28px !important;
+}
+
 @media (max-width: 900px) {
   .sidebar {
     position: static;
@@ -1003,6 +1080,10 @@ h1, h2, h3, h4, strong {
   .app-shell:has(.mobile-analysis-action) {
     padding-bottom: 84px;
   }
+
+  .forecast-story {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 640px) {
@@ -1018,5 +1099,10 @@ h1, h2, h3, h4, strong {
 
   .assumptions dd {
     text-align: left;
+  }
+
+  .driver-list,
+  .distance-bands {
+    grid-template-columns: 1fr;
   }
 }
