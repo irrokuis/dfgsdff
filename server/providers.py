@@ -16,9 +16,9 @@ from server.policy import SEARCH_RADIUS_METERS, build_auckland_overpass_query, b
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 HEADERS = {"User-Agent": "CommercialSiteFeasibilityAPI/2.0 (educational demo)"}
-CACHE_TTL = timedelta(minutes=10)
-STALE_CACHE_TTL = timedelta(hours=24)
-AUCKLAND_CACHE_TTL = timedelta(days=7)
+CACHE_TTL = timedelta(days=1)
+STALE_CACHE_TTL = timedelta(days=7)
+AUCKLAND_CACHE_TTL = timedelta(days=1)
 AUCKLAND_STALE_CACHE_TTL = timedelta(days=90)
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,13 @@ class OpenDataProvider:
         key = (round(latitude, 4), round(longitude, 4), store_type)
         now = datetime.now(UTC)
         cached = self._competitor_cache.get(key)
+        if cached and now - cached[0] < CACHE_TTL:
+            return cached[1], DataFreshness(
+                source="OpenStreetMap via Overpass",
+                fetched_at=cached[0],
+                cache_status="fresh_cache",
+                expires_at=cached[0] + CACHE_TTL,
+            )
         try:
             response = requests.post(OVERPASS_URL, data={"data": build_overpass_query(store_type, latitude, longitude)}, headers=HEADERS, timeout=40)
             response.raise_for_status()
@@ -97,6 +104,8 @@ class OpenDataProvider:
     def _auckland_competitors(self, latitude: float, longitude: float, store_type: StoreType) -> tuple[list[Competitor], DataFreshness]:
         now = datetime.now(UTC)
         cached = self._auckland_cache
+        if cached and now - cached[0] < AUCKLAND_CACHE_TTL:
+            return self._filter_auckland_businesses(cached[1], latitude, longitude, store_type), self._freshness(cached[0], "fresh_cache")
         try:
             response = requests.post(OVERPASS_URL, data={"data": build_auckland_overpass_query()}, headers=HEADERS, timeout=120)
             response.raise_for_status()
